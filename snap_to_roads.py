@@ -15,10 +15,11 @@ keep their recorded position.
 Only the Python standard library is used. The public OSRM demo server is shared:
 the script sends at most one request per second and identifies itself.
 """
+from collections import Counter
 import hashlib, json, math, os, sys, time, urllib.parse, urllib.request
 import xml.etree.ElementTree as ET
 
-VERSION = 1                       # raise to force all tracks to be processed again
+VERSION = 2                       # raise to force all tracks to be processed again
 SERVERS = [s for s in [os.environ.get("OSRM_URL"),
                        "https://router.project-osrm.org",
                        "https://routing.openstreetmap.de/routed-car"] if s]
@@ -135,18 +136,44 @@ def to_unix(iso):
 def coord_str(points):
     return ";".join(f"{p[1]:.6f},{p[0]:.6f}" for p in points)
 
+STATS = Counter()                 # what OSRM answered, printed in the workflow log
+MESSAGES = {}
+
+def note(res):
+    code = res.get("code", "?")
+    STATS[code] += 1
+    if code not in ("Ok", "NoMatch") and res.get("message"):
+        MESSAGES.setdefault(code, res["message"])
+    return code
+
+def match_request(pts, use_radius, use_time):
+    q = {"overview": "full", "geometries": "geojson", "gaps": "ignore"}
+    if use_radius:
+        q["radiuses"] = ";".join([str(SEARCH_RADIUS_M)] * len(pts))
+    if use_time:
+        try:
+            stamps = [to_unix(p[2]) for p in pts]
+            if all(b > a for a, b in zip(stamps, stamps[1:])):
+                q["timestamps"] = ";".join(map(str, stamps))
+        except Exception:
+            pass
+    return get_json(f"/match/v1/driving/{coord_str(pts)}?{urllib.parse.urlencode(q, safe=';,')}")
+
 def match_chunk(pts):
     """Returns a list of (first_index, last_index, [[lat, lon], ...]) for the matched stretches."""
-    q = {"overview": "full", "geometries": "geojson", "gaps": "ignore",
-         "radiuses": ";".join([str(SEARCH_RADIUS_M)] * len(pts))}
-    try:
-        stamps = [to_unix(p[2]) for p in pts]
-        if all(b > a for a, b in zip(stamps, stamps[1:])):
-            q["timestamps"] = ";".join(map(str, stamps))
-    except Exception:
-        pass
-    res = get_json(f"/match/v1/driving/{coord_str(pts)}?{urllib.parse.urlencode(q, safe=';,')}")
-    if res.get("code") != "Ok":
+    res = None
+    # If the server rejects an option, try again with fewer options.
+    for use_radius, use_time in ((True, True), (True, False), (False, False)):
+        res = match_request(pts, use_radius, use_time)
+        code = note(res)
+        if code not in ("InvalidOptions", "InvalidValue", "InvalidQuery"):
+            break
+    if code == "TooBig" and len(pts) > 10:
+        half = len(pts) // 2               # too many points for this server: split and retry
+        first = match_chunk(pts[:half + 1])
+        second = [(lo + half, hi + half, g) for lo, hi, g in match_chunk(pts[half:])]
+        return first + second
+    if code != "Ok":
         return []
     found = {}
     for i, tp in enumerate(res.get("tracepoints") or []):
@@ -162,6 +189,8 @@ def match_chunk(pts):
         # Reject matches that take an implausible detour compared with what was recorded.
         if hi > lo and len(geom) > 1 and mt.get("distance", 0) <= 1.5 * raw_len + 1000:
             out.append((lo, hi, geom))
+        else:
+            STATS["rejected detour"] += 1
     return out
 
 def route_between(a, b):
@@ -171,7 +200,7 @@ def route_between(a, b):
         res = get_json(f"/route/v1/driving/{coord_str([a, b])}?overview=full&geometries=geojson")
     except RuntimeError:
         return None
-    if res.get("code") != "Ok" or not res.get("routes"):
+    if note(res) != "Ok" or not res.get("routes"):
         return None
     r = res["routes"][0]
     geom = [[c[1], c[0]] for c in r["geometry"]["coordinates"]]
@@ -264,6 +293,7 @@ def main():
                     continue
             except Exception:
                 pass
+        STATS.clear(); MESSAGES.clear()
         try:
             name, segments, start, end = parse_gpx(g)
             lines, recorded, shares = [], 0, []
@@ -274,17 +304,25 @@ def main():
                 recorded += len(seg)
             km = sum(length(l) for l in lines) / 1000
             share = sum(shares) / recorded if recorded else 0
+            answers = ", ".join(f"{k}: {v}" for k, v in STATS.items())
+            errors = {k for k in STATS if k not in ("Ok", "NoMatch", "rejected detour")}
+            if share == 0 and errors:
+                # Nothing matched because the server refused the requests: keep the raw track and retry later.
+                details = "; ".join(f"{k}: {m}" for k, m in MESSAGES.items())
+                raise RuntimeError(f"OSRM answered {answers}. {details}")
             json.dump({"version": VERSION, "source": os.path.basename(g), "source_sha": sha,
                        "name": name, "start": start, "end": end, "km": round(km, 1),
                        "on_roads": round(share, 3), "segments": lines},
                       open(target, "w"), separators=(",", ":"))
-            print(f"{g}: {km:.0f} km, {share:.0%} of points on roads")
+            print(f"{g}: {km:.0f} km, {share:.0%} of points on roads (OSRM answers: {answers})")
         except Exception as e:
             failures += 1
-            print(f"{g}: could not be snapped ({e}); the map shows the recorded track", file=sys.stderr)
+            if os.path.exists(target):
+                os.remove(target)              # an outdated result must not hide the problem
+            print(f"::warning::{g} could not be fitted to roads, the map shows the recorded track. {e}")
     if failures:
-        print(f"{failures} file(s) not snapped; they will be tried again on the next upload "
-              f"or when the workflow is run by hand.", file=sys.stderr)
+        print(f"{failures} file(s) not fitted; they are tried again on the next upload "
+              f"or when the workflow is run by hand.")
 
 if __name__ == "__main__":
     main()
