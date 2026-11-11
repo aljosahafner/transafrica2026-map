@@ -1,0 +1,34 @@
+name: Snap tracks to roads
+
+on:
+  push:
+    paths:
+      - "**.gpx"
+      - "**.GPX"
+      - "snap_to_roads.py"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: snap-to-roads
+  cancel-in-progress: false
+
+jobs:
+  snap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Snap new tracks
+        run: python3 snap_to_roads.py
+      - name: Save the results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A snapped
+          if git diff --cached --quiet; then echo "Nothing new."; exit 0; fi
+          git commit -m "Snap new tracks to roads"
+          git pull --rebase
+          git push

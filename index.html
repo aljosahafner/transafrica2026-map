@@ -61,6 +61,19 @@
     border: 1px solid var(--line); border-radius: 6px;
     background: var(--hover); color: var(--panel-text); cursor: pointer;
   }
+  .mode {
+    display: grid; grid-template-columns: 1fr 1fr; margin-top: 10px;
+    border: 1px solid var(--line); border-radius: 6px; overflow: hidden;
+  }
+  .mode[hidden] { display: none; }
+  .mode button {
+    font: inherit; font-size: .95rem; padding: 6px 8px; border: 0; cursor: pointer;
+    background: none; color: var(--muted);
+  }
+  .mode button + button { border-left: 1px solid var(--line); }
+  .mode button[aria-pressed="true"] { background: var(--panel-text); color: var(--panel); font-weight: 500; }
+  .mode button:focus-visible { outline: 2px solid var(--track-latest); outline-offset: -2px; }
+  .mode[aria-busy="true"] button[aria-pressed="true"] { opacity: .7; }
   .days { list-style: none; margin: 0; padding: 4px 0; overflow-y: auto; }
   .days button {
     display: grid; grid-template-columns: 12px 1fr auto; gap: 10px; align-items: center;
@@ -81,6 +94,7 @@
     .panel { width: auto; right: 12px; }
     .toggle { display: block; }
     .panel.collapsed .days, .panel.collapsed footer { display: none; }
+    .leaflet-control-scale { display: none; }
   }
   .leaflet-popup-content { font-family: "Barlow", system-ui, sans-serif; font-size: 15px; }
   .leaflet-popup-content b { font-weight: 500; }
@@ -93,6 +107,10 @@
   <header>
     <h1>Trans-Africa 2026</h1>
     <p class="totals" id="totals">Loading the route…</p>
+    <div class="mode" id="mode" role="group" aria-label="How the track is drawn" hidden>
+      <button type="button" data-mode="roads" aria-pressed="true">Fit to roads</button>
+      <button type="button" data-mode="raw" aria-pressed="false">Raw GPX</button>
+    </div>
     <button class="toggle" id="toggle" aria-expanded="false">Show all days</button>
   </header>
   <ul class="days" id="days"></ul>
@@ -118,7 +136,7 @@ L.control.zoom({ position: "bottomright" }).addTo(map);
 L.control.scale({ imperial: false, position: "bottomleft" }).addTo(map);
 L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
   maxZoom: 18,
-  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors, road fitting by <a href="https://project-osrm.org/">OSRM</a>'
 }).addTo(map);
 
 const css = getComputedStyle(document.documentElement);
@@ -187,9 +205,137 @@ async function fetchText(item) {
 const fmtKm = km => Math.round(km).toLocaleString("en-GB");
 const fmtDate = d => d ? d.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" }) : "";
 
+const totalsEl = document.getElementById("totals");
+const listEl = document.getElementById("days");
+const modeEl = document.getElementById("mode");
+const trackGroup = L.featureGroup().addTo(map);
+const markerGroup = L.layerGroup().addTo(map);
+let files = [];               // [{ it: GPX file, snap: snapped file or undefined }]
+let firstDraw = true, selectedName = null, drawing = 0;
+let mode = "roads";
+try { if (localStorage.getItem("trackMode") === "raw") mode = "raw"; } catch (e) {}
+
+const rawCache = new Map(), snapCache = new Map();
+function loadRaw(it) {
+  if (!rawCache.has(it.sha || it.name)) {
+    rawCache.set(it.sha || it.name, fetchText(it).then(t => parseGpx(t, it.name))
+      .catch(e => { console.warn(it.name, e); rawCache.delete(it.sha || it.name); return null; }));
+  }
+  return rawCache.get(it.sha || it.name);
+}
+function loadSnapped(it, snap) {
+  if (!snapCache.has(it.name)) {
+    snapCache.set(it.name, (async () => {
+      const local = snap.path.split("/").map(encodeURIComponent).join("/");
+      for (const url of [local, snap.download_url]) {   // this site's copy can lag behind a fresh upload
+        try {
+          const r = await fetch(url, { cache: "no-cache" });
+          if (!r.ok) continue;
+          const d = await r.json();
+          if (d.source_sha === it.sha && d.segments?.length) {   // only if made from this exact GPX
+            return { name: d.name, fileName: it.name, segments: d.segments, km: d.km, snapped: true,
+                     start: d.start ? new Date(d.start) : null, end: d.end ? new Date(d.end) : null };
+          }
+        } catch (e) { console.warn(snap.name, e); }
+      }
+      return null;
+    })());
+  }
+  return snapCache.get(it.name);
+}
+async function loadPart(f) {
+  if (mode === "roads" && f.snap) {
+    const d = await loadSnapped(f.it, f.snap);
+    if (d) return d;
+  }
+  return loadRaw(f.it);
+}
+
+function selectDay(day, btn, zoom) {
+  for (const b of listEl.querySelectorAll("button")) b.setAttribute("aria-pressed", "false");
+  trackGroup.eachLayer(l => l.setStyle({ weight: l.options.baseWeight }));
+  selectedName = day.name;
+  btn.setAttribute("aria-pressed", "true");
+  day.layer.setStyle({ weight: day.weight + 4 }).bringToFront();
+  if (zoom) {
+    map.fitBounds(day.layer.getBounds(), { padding: [40, 40] });
+    if (matchMedia("(max-width: 600px)").matches) toggle.click();
+    day.layer.openPopup(day.layer.getBounds().getCenter());
+  }
+}
+
+async function draw() {
+  const run = ++drawing;
+  for (const b of modeEl.querySelectorAll("button")) b.setAttribute("aria-pressed", String(b.dataset.mode === mode));
+  modeEl.setAttribute("aria-busy", "true");
+  const results = await Promise.all(files.map(loadPart));
+  if (run !== drawing) return;            // the switch was used again while loading
+  modeEl.removeAttribute("aria-busy");
+
+  const parts = results.filter(Boolean).sort((a, b) =>
+    (a.start && b.start) ? a.start - b.start : a.fileName.localeCompare(b.fileName, undefined, { numeric: true }));
+  const skipped = results.length - parts.length;
+  // Garmin sometimes splits one day into several files with the same track name: show them as one day.
+  const byName = new Map();
+  for (const p of parts) {
+    const d = byName.get(p.name);
+    if (!d) { byName.set(p.name, { ...p, segments: [...p.segments], allSnapped: !!p.snapped }); continue; }
+    d.segments.push(...p.segments);
+    d.km += p.km;
+    d.allSnapped = d.allSnapped && !!p.snapped;
+    if (p.start && (!d.start || p.start < d.start)) d.start = p.start;
+    if (p.end && (!d.end || p.end > d.end)) d.end = p.end;
+  }
+  const days = [...byName.values()];
+  trackGroup.clearLayers(); markerGroup.clearLayers(); listEl.innerHTML = "";
+  if (!days.length) { totalsEl.textContent = "The tracks could not be read."; return; }
+
+  days.forEach((day, i) => {
+    const latest = i === days.length - 1;
+    day.color = latest ? color("--track-latest") : (i % 2 ? color("--track-b") : color("--track-a"));
+    day.weight = latest ? 5 : 4;
+    const popup = `<b>${day.name}</b><br>${fmtDate(day.start)}<br>${fmtKm(day.km)} km`;
+    day.layer = L.polyline(day.segments, { color: day.color, weight: day.weight, baseWeight: day.weight, opacity: .9 })
+      .bindPopup(popup).addTo(trackGroup);
+  });
+
+  const last = days[days.length - 1];
+  const lastSeg = last.segments[last.segments.length - 1];
+  L.circleMarker(lastSeg[lastSeg.length - 1], { radius: 8, color: "#fff", weight: 3, fillColor: color("--track-latest"), fillOpacity: 1 })
+    .bindPopup(`<b>Last position</b><br>${fmtDate(last.end || last.start)}`).addTo(markerGroup);
+
+  if (firstDraw) { map.fitBounds(trackGroup.getBounds(), { padding: [30, 30] }); firstDraw = false; }
+
+  const total = days.reduce((s, d) => s + d.km, 0);
+  const notFitted = mode === "roads" ? days.filter(d => !d.allSnapped).length : 0;
+  totalsEl.innerHTML = `<strong>${days.length}</strong> ${days.length === 1 ? "day" : "days"} on the road, <strong>${fmtKm(total)}</strong> km` +
+    (notFitted ? `<br>${notFitted === 1 ? "1 day is" : notFitted + " days are"} not fitted to roads yet` : "") +
+    (skipped ? `<br>${skipped} file${skipped > 1 ? "s" : ""} could not be read` : "");
+
+  for (const day of [...days].reverse()) {
+    const li = document.createElement("li");
+    const b = document.createElement("button");
+    b.setAttribute("aria-pressed", "false");
+    b.innerHTML = `<span class="swatch" style="background:${day.color}"></span>
+      <span><span class="day-name"></span><span class="day-date">${fmtDate(day.start)}</span></span>
+      <span class="day-km">${fmtKm(day.km)} km</span>`;
+    b.querySelector(".day-name").textContent = day.name;
+    b.addEventListener("click", () => selectDay(day, b, true));
+    li.appendChild(b);
+    listEl.appendChild(li);
+    if (day.name === selectedName) selectDay(day, b, false);   // keep the selection when switching
+  }
+}
+
+modeEl.addEventListener("click", e => {
+  const b = e.target.closest("button[data-mode]");
+  if (!b || b.dataset.mode === mode) return;
+  mode = b.dataset.mode;
+  try { localStorage.setItem("trackMode", mode); } catch (e) {}
+  draw();
+});
+
 async function main() {
-  const totals = document.getElementById("totals");
-  const list = document.getElementById("days");
   try {
     const root = await listFiles("");
     let items = root.filter(f => f.type === "file" && /\.gpx$/i.test(f.name));
@@ -197,72 +343,18 @@ async function main() {
       const sub = await listFiles("gpx");
       items = items.concat(sub.filter(f => f.type === "file" && /\.gpx$/i.test(f.name)));
     }
-    if (!items.length) { totals.textContent = "No tracks uploaded yet."; return; }
+    if (!items.length) { totalsEl.textContent = "No tracks uploaded yet."; return; }
 
-    const results = await Promise.all(items.map(async it => {
-      try { return parseGpx(await fetchText(it), it.name); }
-      catch (e) { console.warn(it.name, e); return null; }
-    }));
-    const parts = results.filter(Boolean).sort((a, b) =>
-      (a.start && b.start) ? a.start - b.start : a.fileName.localeCompare(b.fileName, undefined, { numeric: true }));
-    const skipped = results.length - parts.length;
-    // Garmin sometimes splits one day into several files with the same track name: show them as one day.
-    const byName = new Map();
-    for (const p of parts) {
-      const d = byName.get(p.name);
-      if (!d) { byName.set(p.name, { ...p, segments: [...p.segments] }); continue; }
-      d.segments.push(...p.segments);
-      d.km += p.km;
-      if (p.start && (!d.start || p.start < d.start)) d.start = p.start;
-      if (p.end && (!d.end || p.end > d.end)) d.end = p.end;
+    // Road-fitted versions made by the "Snap tracks to roads" workflow (snapped/<file>.json).
+    const snapped = new Map();
+    if (root.some(f => f.type === "dir" && f.name === "snapped")) {
+      for (const f of await listFiles("snapped")) snapped.set(f.name.replace(/\.json$/i, ""), f);
     }
-    const days = [...byName.values()];
-
-    const all = L.featureGroup().addTo(map);
-    let selected = null;
-    days.forEach((day, i) => {
-      const latest = i === days.length - 1;
-      day.color = latest ? color("--track-latest") : (i % 2 ? color("--track-b") : color("--track-a"));
-      day.weight = latest ? 5 : 4;
-      const popup = `<b>${day.name}</b><br>${fmtDate(day.start)}<br>${fmtKm(day.km)} km`;
-      day.layer = L.polyline(day.segments, { color: day.color, weight: day.weight, opacity: .9 })
-        .bindPopup(popup).addTo(all);
-    });
-
-    const last = days[days.length - 1];
-    const lastSeg = last.segments[last.segments.length - 1];
-    const lastPt = lastSeg[lastSeg.length - 1];
-    L.circleMarker(lastPt, { radius: 8, color: "#fff", weight: 3, fillColor: color("--track-latest"), fillOpacity: 1 })
-      .bindPopup(`<b>Last position</b><br>${fmtDate(last.end || last.start)}`).addTo(map);
-
-    map.fitBounds(all.getBounds(), { padding: [30, 30] });
-
-    const total = days.reduce((s, d) => s + d.km, 0);
-    totals.innerHTML = `<strong>${days.length}</strong> ${days.length === 1 ? "day" : "days"} on the road, <strong>${fmtKm(total)}</strong> km` +
-      (skipped ? `<br>${skipped} file${skipped > 1 ? "s" : ""} could not be read` : "");
-
-    for (const day of [...days].reverse()) {
-      const li = document.createElement("li");
-      const b = document.createElement("button");
-      b.setAttribute("aria-pressed", "false");
-      b.innerHTML = `<span class="swatch" style="background:${day.color}"></span>
-        <span><span class="day-name"></span><span class="day-date">${fmtDate(day.start)}</span></span>
-        <span class="day-km">${fmtKm(day.km)} km</span>`;
-      b.querySelector(".day-name").textContent = day.name;
-      b.addEventListener("click", () => {
-        if (selected) { selected.btn.setAttribute("aria-pressed", "false"); selected.layer.setStyle({ weight: selected.weight }); }
-        selected = { btn: b, layer: day.layer, weight: day.weight };
-        b.setAttribute("aria-pressed", "true");
-        day.layer.setStyle({ weight: day.weight + 4 }).bringToFront();
-        map.fitBounds(day.layer.getBounds(), { padding: [40, 40] });
-        if (matchMedia("(max-width: 600px)").matches) toggle.click();
-        day.layer.openPopup(day.layer.getBounds().getCenter());
-      });
-      li.appendChild(b);
-      list.appendChild(li);
-    }
+    files = items.map(it => ({ it, snap: snapped.get(it.name) }));
+    if (snapped.size) modeEl.hidden = false;   // the switch only makes sense once something is fitted
+    await draw();
   } catch (e) {
-    totals.textContent = `The route could not be loaded: ${e.message}`;
+    totalsEl.textContent = `The route could not be loaded: ${e.message}`;
   }
 }
 main();
