@@ -203,9 +203,20 @@ async function main() {
       try { return parseGpx(await fetchText(it), it.name); }
       catch (e) { console.warn(it.name, e); return null; }
     }));
-    const days = results.filter(Boolean).sort((a, b) =>
+    const parts = results.filter(Boolean).sort((a, b) =>
       (a.start && b.start) ? a.start - b.start : a.fileName.localeCompare(b.fileName, undefined, { numeric: true }));
-    const skipped = results.length - days.length;
+    const skipped = results.length - parts.length;
+    // Garmin sometimes splits one day into several files with the same track name: show them as one day.
+    const byName = new Map();
+    for (const p of parts) {
+      const d = byName.get(p.name);
+      if (!d) { byName.set(p.name, { ...p, segments: [...p.segments] }); continue; }
+      d.segments.push(...p.segments);
+      d.km += p.km;
+      if (p.start && (!d.start || p.start < d.start)) d.start = p.start;
+      if (p.end && (!d.end || p.end > d.end)) d.end = p.end;
+    }
+    const days = [...byName.values()];
 
     const all = L.featureGroup().addTo(map);
     let selected = null;
